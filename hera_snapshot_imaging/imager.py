@@ -18,23 +18,52 @@ c_mps = 299792458.0 # speed of light in meters per second
 def gaussian(r, eps):
     return np.exp(-(r/eps)**2)
 
-@nb.njit(fastmath=True, parallel=True)
-def eval_uv_interp(uv_img, uv_nodes, eps_arr, coeffs):
+@nb.njit("c16[:,:](f8[:,:,:], f8[:,:], f8[:], c16[:])", fastmath=True, cache=True)
+def eval_uv_interp(uv_grid, uv_nodes, eps_arr, coeffs):
+    tol = 1e-14
 
-    Nu, Nv = uv_img.shape[0], uv_img.shape[1]
+    Nu, Nv = uv_grid.shape[0], uv_grid.shape[1]
     Nn = uv_nodes.shape[0]
+
+    u_ax = uv_grid[0,:,0]
+    v_ax = uv_grid[:,0,1]
+
+    delta_uv = u_ax[1] - u_ax[0]
 
     uv_interp = np.zeros((Nu, Nv), dtype=nb.complex128)
 
-    for ii in nb.prange(Nu):
-        for jj in nb.prange(Nv):
-            for kk in range(Nn):
+    for nn in nb.prange(Nn):
+        eps_arr[nn] = eps_arr[nn]
+        uv_n = uv_nodes[nn]
+        c_n = coeffs[nn]
 
-                r_eval = np.sqrt(np.sum(np.square(uv_img[ii,jj,:] - uv_nodes[kk,:])))
+        # half size of the bounding square
+        kernel_size = eps_arr[nn] * np.sqrt(np.log(1/tol))
 
-                uv_interp[ii,jj] += gaussian(r_eval, eps_arr[kk]) * coeffs[kk]
+        # half the number of grid points on a side
+        Nk = int(np.ceil(kernel_size / delta_uv))
+
+        # indices of nearest grid point to the node
+        ic_un = np.argmin(np.abs(uv_n[0] - u_ax))
+        ic_vn = np.argmin(np.abs(uv_n[1] - v_ax))
+
+        # indices of the bounding square on the grid
+        i0_u = ic_un - Nk
+        i1_u = ic_un + Nk + 1
+
+        i0_v = ic_vn - Nk
+        i1_v = ic_vn + Nk + 1
+
+        for ii in range(i0_v, i1_v):
+            for jj in range(i0_u, i1_u):
+
+                r_eval = np.sqrt(np.sum(np.square(uv_grid[ii,jj,:] - uv_nodes[nn,:])))
+
+                if r_eval < kernel_size:
+                    uv_interp[ii,jj] += gaussian(r_eval, eps_arr[nn]) * coeffs[nn]
 
     return uv_interp
+
 
 class Interpolator:
 
@@ -69,7 +98,7 @@ class HERASnapshotImager:
 
         # uvd.compress_by_redundancy(method='average', tol=0.4, inplace=True)
         # uvd.reorder_blts(order="time", conj_convention='ant1<ant2')
-        uvd.select(bls=[(i,j) for (i,j) in uvd.get_antpairs() if i != j])
+        # uvd.select(bls=[(i,j) for (i,j) in uvd.get_antpairs() if i != j])
 
 
         self.uvd = uvd
@@ -127,7 +156,7 @@ class HERASnapshotImager:
         self.l_ax = l_ax
         self.m_ax = np.copy(l_ax)
 
-    def compute_images(self, average_frequencies=True, compute_psf=False):
+    def compute_images(self, average_frequencies=False, compute_psf=False):
 
         if average_frequencies:
             self.img_ests = np.zeros((self.Nt, self.Np, self.Np))
@@ -151,6 +180,8 @@ class HERASnapshotImager:
                 uv_taper_scale = (nu / c_mps) * max(self.max_be, self.max_bn) * self.uv_taper_scale
 
                 uv_taper = np.exp(-(self.uv_grid[...,0]**2. + self.uv_grid[...,1]**2.)/uv_taper_scale**2.)
+            else:
+                uv_taper = np.ones_like(self.uv_grid)
 
             for i_t in range(self.Nt):
 
@@ -171,7 +202,7 @@ class HERASnapshotImager:
                 img_est = np.real(img_est)
                 img_est = np.fliplr(img_est)
 
-                img_est *= self.delta_uv**2. / np.sqrt(img_est.size)
+                img_est *= (2*np.pi)**2. * self.delta_uv**2. / img_est.size
 
                 if compute_psf:
                     psf_est = np.fft.fft2(np.fft.ifftshift(uv_samp, axes=(0,1)))
@@ -179,12 +210,19 @@ class HERASnapshotImager:
                     psf_est = np.real(psf_est)
                     psf_est = np.fliplr(psf_est)
 
-                    psf_est /= self.delta_uv**2. / np.sqrt(psf_est.size)
+                    psf_est *= (2*np.pi)**2. * self.delta_uv**2. / img_est.size
 
                 if average_frequencies:
                     self.img_ests[i_t] += img_est
+
+                    if compute_psf:
+                        self.psf_ests[i_t] += psf_est
+
                 else:
                     self.img_ests[i_f, i_t] = img_est
+
+                    if compute_psf:
+                        self.psf_ests[i_f, i_t] = psf_est
 
         if average_frequencies:
             self.img_ests /= self.Nf
@@ -193,8 +231,15 @@ class HERASnapshotImager:
 
                 self.psf_ests /= self.Nf
 
-
-
+    def print_image_array_layout(self):
+        if self.img_ests is None:
+            print("No images computed yet.")
+        elif len(self.img_ests) == 3:
+            print("Axes:(Times, l, m)")
+        elif len(self.img_ests) == 4:
+            print("Axis:(Frequencies, Times, l, m)")
+        else:
+            print("WTF mate?")
 
 def recommended_preprocessing(uvd, uvc):
 
