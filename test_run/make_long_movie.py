@@ -314,7 +314,7 @@ for tidx in range(0,HSI.Nt):
 
 print("Done with plots.")
 # print("Building movie...")
-# 
+#
 # os.system("~/zmartino/ffmpeg/ffmpeg-git-20220910-amd64-static/ffmpeg -framerate 48 -pattern_type glob -i 'integration_*.png' test_movie.webm")
 
 print("Done")

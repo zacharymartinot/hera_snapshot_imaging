@@ -18,7 +18,7 @@ c_mps = 299792458.0 # speed of light in meters per second
 def gaussian(r, eps):
     return np.exp(-(r/eps)**2)
 
-@nb.njit("c16[:,:](f8[:,:,:], f8[:,:], f8[:], c16[:])", fastmath=True, cache=True)
+@nb.njit("c16[:,:](f8[:,:,:], f8[:,:], f8[:], c16[:])", fastmath=True, parallel=True, cache=True)
 def eval_uv_interp(uv_grid, uv_nodes, eps_arr, coeffs):
     tol = 1e-14
 
@@ -156,7 +156,7 @@ class HERASnapshotImager:
         self.l_ax = l_ax
         self.m_ax = np.copy(l_ax)
 
-    def compute_images(self, average_frequencies=False, compute_psf=False):
+    def compute_images(self, average_frequencies=True, compute_psf=False):
 
         if average_frequencies:
             self.img_ests = np.zeros((self.Nt, self.Np, self.Np))
