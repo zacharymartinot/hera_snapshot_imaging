@@ -4,13 +4,16 @@ import numba as nb
 from scipy import linalg
 from scipy.spatial.distance import cdist
 
-import glob
-import os
-import copy
-import yaml
+from scipy.spatial import ConvexHull
+from scipy.interpolate import CloughTocher2DInterpolator, PchipInterpolator
+from scipy.interpolate import interp1d
 
-import pyuvdata
-import hera_cal
+from astropy import units
+from astropy.coordinates import SkyCoord, AltAz, EarthLocation
+from astropy.time import Time
+
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+from matplotlib.transforms import Bbox
 
 c_mps = 299792458.0 # speed of light in meters per second
 
@@ -64,7 +67,6 @@ def eval_uv_interp(uv_grid, uv_nodes, eps_arr, coeffs):
 
     return uv_interp
 
-
 class Interpolator:
 
     def __init__(self, uv_nodes, eps, uv_node_diffs=None, uv_vals=None):
@@ -92,39 +94,72 @@ class Interpolator:
 
         return uv_interp
 
+def get_bounding_curve(uv_vectors):
+    uv_convex_hull = ConvexHull(uv_vectors)
+    chv = uv_vectors[uv_convex_hull.vertices]
+    chv_shift = np.concatenate((chv[1:], chv[0].reshape(1,-1)), axis=0)
+    edge_points = 0.5*(chv_shift - chv) + chv
+
+    t_pts = np.unwrap(np.arctan2(edge_points[:,1], edge_points[:,0]))
+    t_pts = np.r_[t_pts, t_pts[0] + 2*np.pi]
+    t0 = t_pts[0]
+
+    edge_points_periodic = np.r_[edge_points, edge_points[0].reshape(1,-1)]
+
+    bounding_curve = PchipInterpolator(t_pts, edge_points_periodic)
+
+    return bounding_curve, t0
+
+def grid_boundary_angle(uv_grid, t0):
+    uv_t = np.arctan2(uv_grid[...,1], uv_grid[...,0])
+    uv_t[np.where(uv_t < t0)] += 2*np.pi
+    return uv_t
+
+def get_taper(uv_grid, uv_vectors, taper_type='hann'):
+
+    bounding_curve, t0 = get_bounding_curve(uv_vectors)
+
+    uv_grid_angles = grid_boundary_angle(uv_grid, t0)
+
+    uv_grid_boundary_points = bounding_curve(uv_grid_angles)
+
+    L_grid = np.sqrt(np.sum(np.square(uv_grid_boundary_points), axis=-1))
+    uv_grid_length = np.sqrt(np.sum(np.square(uv_grid), axis=-1))
+
+    interior_pts = np.asarray(uv_grid_length < L_grid)
+    taper = np.zeros(uv_grid.shape[:2])
+    if taper_type == 'hann':
+        x = uv_grid_length[interior_pts]
+        L = L_grid[interior_pts]
+        taper[interior_pts] = np.cos(0.5*np.pi * x / L)**2
+    elif taper_type == 'gaussian':
+        r = uv_grid_length[interior_pts]
+        eps = np.max(L_grid)/np.sqrt(np.log(1e8))
+        taper[interior_pts] = np.exp(-(r/eps)**2)
+
+    else:
+        taper[interior_pts] = 1.0
+
+    return taper
+
 class HERASnapshotImager:
 
-    def __init__(self, uvd, pad_factor=3.0, delta_uv=0.5, uv_taper_scale=None, output_crop_lim=None):
+    def __init__(self, vis_data, b_vectors, freqs_hz, lsts, times,
+                 pad_factor=2.0, delta_uv=1.0):
 
-        # uvd.compress_by_redundancy(method='average', tol=0.4, inplace=True)
-        # uvd.reorder_blts(order="time", conj_convention='ant1<ant2')
-        # uvd.select(bls=[(i,j) for (i,j) in uvd.get_antpairs() if i != j])
-
-
-        self.uvd = uvd
-        self.uv_taper_scale = uv_taper_scale
-        self.output_crop_lim = output_crop_lim
-
-        self.times = uvd.time_array[::uvd.Nbls]
-        self.lsts = uvd.lst_array[::uvd.Nbls]
-        self.nu_hz = uvd.freq_array[0]
+        self.times = times
+        self.lsts = lsts
+        self.nu_hz = freqs_hz
 
         self.Nt = len(self.lsts)
         self.Nf = len(self.nu_hz)
+        self.Nb = b_vectors.shape[0]
 
-        self.ant_pos, self.ant_num = uvd.get_ENU_antpos(center=True, pick_data_ants=True)
-        self.ant_map = {a:r for (a,r) in zip(self.ant_num, self.ant_pos)}
-
-        bl_nums = uvd.get_baseline_nums()
-
-        # set of baselines to be used
-        # self.b_vectors = np.array([
-        #     self.ant_map[j] - self.ant_map[i] for (i,j) in list(map(uvdr.baseline_to_antnums, bl_nums))]
-        # ])
-        self.b_vectors = uvd.uvw_array[0:uvd.Nbls]
-
+        self.b_vectors = b_vectors
         # include the reflections of each baseline
         self.b_vectors = np.r_[self.b_vectors, -self.b_vectors]
+
+        self.vis_data = vis_data
 
         self.max_be = np.max(abs(self.b_vectors[:,0]))
         self.max_bn = np.max(abs(self.b_vectors[:,1]))
@@ -156,18 +191,88 @@ class HERASnapshotImager:
         self.l_ax = l_ax
         self.m_ax = np.copy(l_ax)
 
-    def compute_images(self, average_frequencies=True, compute_psf=False):
+    def compute_gridded_mfs_images(self, taper_type='hann', gaussian_taper_tol=1e-8, kernel_size=0.5, weighted=True):
 
-        if average_frequencies:
-            self.img_ests = np.zeros((self.Nt, self.Np, self.Np))
+        self.gaussian_taper_tol = gaussian_taper_tol
+
+        self.mfs_images = np.zeros((self.Nt, self.Np, self.Np))
+
+        inv_lambda = self.nu_hz / c_mps
+        uv_vectors = np.concatenate([nc * self.b_vectors for nc in inv_lambda], axis=0)
+
+        if taper_type == 'gaussian':
+
+            uv_taper_scale = np.sqrt(np.log(1/gaussian_taper_tol)) * (np.max(self.nu_hz)/ c_mps) * max(self.max_be, self.max_bn)
+
+            uv_taper = np.exp(-(self.uv_grid[...,0]**2. + self.uv_grid[...,1]**2.)/uv_taper_scale**2.)
 
         else:
-            self.img_ests = np.zeros((self.Nf, self.Nt, self.Np, self.Np))
+            # hann or top-hat over convex hull of uv samples
+            uv_taper = get_taper(self.uv_grid[...,:2], uv_vectors[:,:2], taper_type=taper_type)
 
-        if compute_psf:
-            self.psf_ests = np.zeros_like(self.img_ests)
+        eps = kernel_size*(np.mean(self.nu_hz) / c_mps) * np.min(self.b_min_dist)
+        eps = eps * np.ones(uv_vectors.shape[0])
+
+        if weighted:
+
+            unit_data = np.ones(uv_vectors.shape[0], dtype=complex)
+
+            sampling = np.real(eval_uv_interp(self.uv_grid, uv_vectors, eps, unit_data))
+
+            self.weights = 1 / (1e-8 + sampling)
+            self.weights /= np.mean(weights)
+
+            uv_taper *= self.weights
+
+        for i_t in range(self.Nt):
+
+            uv_vals = np.concatenate([np.r_[self.vis_data[i_t, i_f], np.conj(self.vis_data[i_t, i_f])] for i_f in range(self.Nf)],axis=0)
+
+            uv_interp = eval_uv_interp(self.uv_grid, uv_vectors, eps, uv_vals)
+
+            uv_interp *= uv_taper
+
+            mfs_img = np.fft.fft2((np.fft.ifftshift(uv_interp, axes=(0,1))))
+            mfs_img = np.fft.fftshift(mfs_img, axes=(0,1))
+            mfs_img = np.real(mfs_img) * (2*np.pi)**2 * self.delta_uv**2 / mfs_img.size
+            mfs_img = np.fliplr(mfs_img)
+
+            self.mfs_images[i_t] = mfs_img
+
+    def compute_single_channel_spline_images(self, taper_type='hann'):
+
+        self.uv_taper_scale = uv_taper_scale
+
+        self.img_ests = np.zeros((self.Nf, self.Nt, self.Np, self.Np))
 
         for i_f in range(self.Nf):
+
+            nu = self.nu_hz[i_f]
+            uv_vectors = (nu / c_mps) * self.b_vectors[:,:2]
+            uv_taper = get_taper(self.uv_grid, uv_vectors, taper_type=taper_type)
+
+            for i_t in range(self.Nt):
+                uv_vals = np.r_[self.vis_data[i_t, i_f], np.conj(self.vis_data[i_t, i_f])]
+
+                intp_spline = CloughTocher2DInterpolator(uv_vectors, uv_vals, fill_value=0.0)
+                uv_interp = uv_taper * intp_spline(self.uv_grid[...,:2])
+                img_est = np.fft.fft2(np.fft.ifftshift(uv_interp, axes=(0,1)))
+                img_est = np.fft.fftshift(img_est, axes=(0,1))
+                img_est = np.real(img_est)
+                img_est = np.fliplr(img_est)
+
+                img_est *= (2*np.pi)**2. * self.delta_uv**2. / img_est.size
+
+                self.img_ests[i_f, i_t] = img_est
+
+    def compute_single_channel_rbf_images(self, uv_taper_scale=0.5):
+
+        self.uv_taper_scale = uv_taper_scale
+
+        self.img_ests = np.zeros((self.Nf, self.Nt, self.Np, self.Np))
+
+        for i_f in range(self.Nf):
+
             nu = self.nu_hz[i_f]
             uv_locs = (nu / c_mps) * self.b_vectors
             eps = (nu / c_mps) * self.b_min_dist
@@ -181,21 +286,14 @@ class HERASnapshotImager:
 
                 uv_taper = np.exp(-(self.uv_grid[...,0]**2. + self.uv_grid[...,1]**2.)/uv_taper_scale**2.)
             else:
-                uv_taper = np.ones_like(self.uv_grid)
+                uv_taper = np.ones_like(self.uv_grid[:,:,0])
 
             for i_t in range(self.Nt):
 
-                blt_slice = slice(i_t*self.uvd.Nbls, (i_t+1)*self.uvd.Nbls)
-                uv_vals = 0.5*(self.uvd.data_array[blt_slice,0,i_f,0] + self.uvd.data_array[blt_slice,0,i_f,1])
+                uv_vals = np.r_[self.vis_data[i_t, i_f], np.conj(self.vis_data[i_t, i_f])]
 
-                uv_vals = np.r_[uv_vals, np.conj(uv_vals)]
                 K.compute_coefficients(uv_vals)
                 uv_interp = uv_taper * K(self.uv_grid)
-
-                if compute_psf:
-                    K.compute_coefficients(np.ones_like(uv_vals))
-                    uv_samp = uv_taper * K(self.uv_grid)
-
 
                 img_est = np.fft.fft2(np.fft.ifftshift(uv_interp, axes=(0,1)))
                 img_est = np.fft.fftshift(img_est, axes=(0,1))
@@ -204,43 +302,201 @@ class HERASnapshotImager:
 
                 img_est *= (2*np.pi)**2. * self.delta_uv**2. / img_est.size
 
-                if compute_psf:
-                    psf_est = np.fft.fft2(np.fft.ifftshift(uv_samp, axes=(0,1)))
-                    psf_est = np.fft.fftshift(psf_est, axes=(0,1))
-                    psf_est = np.real(psf_est)
-                    psf_est = np.fliplr(psf_est)
+                self.img_ests[i_f, i_t] = img_est
 
-                    psf_est *= (2*np.pi)**2. * self.delta_uv**2. / img_est.size
+    def compute_spline_mfs_images(self, taper_type='hann', doing_it_anyway=False):
 
-                if average_frequencies:
-                    self.img_ests[i_t] += img_est
+        if not doing_it_anyway:
+            raise Exception("This doesn't work, don't do this.")
 
-                    if compute_psf:
-                        self.psf_ests[i_t] += psf_est
+        self.mfs_images = np.zeros((self.Nt, self.Np, self.Np))
 
-                else:
-                    self.img_ests[i_f, i_t] = img_est
+        inv_lambda = self.nu_hz / c_mps
+        uv_vectors = np.concatenate([nc * self.b_vectors[:,:2] for nc in inv_lambda], axis=0)
 
-                    if compute_psf:
-                        self.psf_ests[i_f, i_t] = psf_est
+        uv_taper = get_taper(self.uv_grid, uv_vectors, taper_type=taper_type)
 
-        if average_frequencies:
-            self.img_ests /= self.Nf
+        for i_t in range(self.Nt):
 
-            if compute_psf:
+            uv_vals = np.concatenate([np.r_[self.vis_data[i_t, i_f], np.conj(self.vis_data[i_t, i_f])] for i_f in range(self.Nf)],axis=0)
 
-                self.psf_ests /= self.Nf
+            intp_spline = CloughTocher2DInterpolator(uv_vectors, uv_vals, fill_value=0.0)
 
-    def print_image_array_layout(self):
-        if self.img_ests is None:
-            print("No images computed yet.")
-        elif len(self.img_ests) == 3:
-            print("Axes:(Times, l, m)")
-        elif len(self.img_ests) == 4:
-            print("Axis:(Frequencies, Times, l, m)")
-        else:
-            print("WTF mate?")
+            uv_interp = uv_taper * intp_spline(self.uv_grid[...,:2])
 
-def recommended_preprocessing(uvd, uvc):
+            mfs_img = np.fft.fft2((np.fft.ifftshift(uv_interp, axes=(0,1))))
+            mfs_img = np.fft.fftshift(mfs_img, axes=(0,1))
+            mfs_img = np.real(mfs_img) * (2*np.pi)**2 * self.delta_uv**2 / mfs_img.size
+            mfs_img = np.fliplr(mfs_img)
 
-    return
+            self.mfs_images[i_t] = mfs_img
+
+@nb.vectorize("float64(float64, float64)")
+def ra_distance_degrees(ra1, ra2):
+    abs_diff = np.abs(ra1 - ra2)
+    return min(abs_diff, abs(abs_diff - 360.))
+
+def image_plot(HSI, tidx, fidx, vmin=None,vmax=None, mfs=False, edge=0.15):
+
+    l_ax = HSI.l_ax
+    m_ax = HSI.m_ax
+    frequency_mhz = HSI.nu_hz[fidx]*1e-6
+
+    def lm2altaz(l,m):
+        n = np.sqrt(l**2. + m**2.)
+        az = np.arctan2(l, m)
+        alt = np.arccos(n)
+        return alt, az
+
+    def altaz2lm(alt, az):
+        l = np.cos(alt)*np.sin(az)
+        m = np.cos(alt)*np.cos(az)
+        return l, m
+
+    HERA_LAT = np.radians(-30.72152777777791)
+    HERA_LON = np.radians(21.428305555555557)
+    HERA_HEIGHT = 1073.0000000093132  # meters
+
+    hera_location = EarthLocation(lat=HERA_LAT*units.rad, lon=HERA_LON*units.rad, height=HERA_HEIGHT*units.meter)
+
+    def get_lines_of_constant_dec(decs_deg, jd, ra0, hera_location):
+        Npts = 21
+        obstime = Time(jd, format='jd', scale='ut1')
+        ra_pts = np.linspace(ra0 - np.radians(30.), ra0 + np.radians(30.), Npts, endpoint=True)
+
+        ra_pts = np.mod(ra_pts, 2*np.pi)
+
+        dec_curves = {}
+        for dec_deg in decs_deg:
+            dec_pts = np.radians(dec_deg)*np.ones(Npts)
+
+            radec_coords = SkyCoord(ra=ra_pts*units.rad, dec=dec_pts*units.rad, frame='icrs')
+            altaz = radec_coords.transform_to(AltAz(obstime=obstime, location=hera_location))
+            alt = altaz.alt.rad
+            az = altaz.az.rad
+
+            l_p, m_p = altaz2lm(alt, az)
+
+            dec_curve = interp1d(l_p, m_p, kind='cubic', bounds_error=False, fill_value=np.nan)
+
+
+            dec_curves[dec_deg] = dec_curve
+
+        return dec_curves
+
+    def get_lines_of_constant_ra(ras_deg, jd, dec0, hera_location):
+        Npts = 21
+        obstime = Time(jd, format='jd', scale='ut1')
+        dec_pts = np.linspace(dec0 - np.radians(29.9), dec0+np.radians(30.), Npts)
+
+        ra_curves = {}
+        for ra_deg in ras_deg:
+
+            ra_pts = np.radians(ra_deg)*np.ones(Npts)
+
+            radec_coords = SkyCoord(ra=ra_pts*units.rad, dec=dec_pts*units.rad, frame='icrs')
+            altaz = radec_coords.transform_to(AltAz(obstime=obstime, location=hera_location))
+            alt = altaz.alt.rad
+            az = altaz.az.rad
+
+            l_p, m_p = altaz2lm(alt, az)
+
+            ra_curve = interp1d(l_p, m_p, kind='cubic', bounds_error=False, fill_value=np.nan)
+
+            ra_curves[ra_deg] = ra_curve
+
+        return ra_curves
+
+    decs = np.linspace(-20,-40,5)
+    dec_curves = get_lines_of_constant_dec(decs, HSI.times[0], HSI.lsts[0], hera_location)
+
+    all_ras = np.linspace(0, 360, 360//5 + 1)
+    dec0 = HERA_LAT
+
+    ra0 = np.degrees(HSI.lsts[tidx])
+
+    ras = all_ras[np.where(ra_distance_degrees(all_ras, ra0) < 25.)]
+
+    ra_curves = get_lines_of_constant_ra(ras, HSI.times[tidx], dec0, hera_location)
+
+    dec_tick_locs = []
+    for dec in dec_curves:
+        dec_curve = dec_curves[dec]
+
+        dec_tick_locs.append(dec_curve(-0.2))
+
+    dec_tick_labels = list(map(int,decs))
+
+    ra_tick_locs = []
+    for ra in ra_curves:
+        ra_curve = ra_curves[ra]
+        m_vals = ra_curve(-l_ax)
+        l_idx = np.nanargmin(abs(-0.2 - m_vals))
+
+        ra_tick_locs.append(l_ax[l_idx])
+
+    ra_tick_labels = list(map(int, ras))
+
+    extent = [l_ax[0], l_ax[-1], m_ax[-1], m_ax[0]]
+
+    fig, ax = plt.subplots(1,1,figsize=(8,8),facecolor='white')
+    if mfs:
+        img_est = HSI.mfs_images[tidx]
+    else:
+        img_est = HSI.img_ests[fidx, tidx]
+
+    img = ax.imshow(img_est, extent=extent, aspect='equal', cmap='Greys_r', vmin=vmin, vmax=vmax)
+
+    ax.plot(0., 0., 'or', ms=3, markerfacecolor='None')
+
+    divider = make_axes_locatable(ax)
+    cax = divider.append_axes("right", size="5%", pad=0.01)
+    cbar = fig.colorbar(img, cax=cax)
+
+    dec_tick_locs = []
+    for dec in dec_curves:
+        dec_curve = dec_curves[dec]
+
+        ax.plot(l_ax, dec_curve(l_ax), '--w', linewidth=1)
+        dec_tick_locs.append(dec_curve(-0.2))
+
+    dec_tick_labels = list(map(int,decs))
+
+    ra_tick_locs = []
+    for ra in ra_curves:
+        ra_curve = ra_curves[ra]
+        try:
+            m_vals = ra_curve(-l_ax)
+            l_idx = np.nanargmin(abs(-0.2 - m_vals))
+
+            ax.plot(l_ax, m_vals, '--w', linewidth=1)
+
+            ra_tick_locs.append(l_ax[l_idx])
+        except ValueError:
+            print(ra, ra0)
+            ax.plot([0., 0.], [-1,1], '--w', linewidth=1)
+
+            ra_tick_locs.append(0.0)
+
+    ra_tick_labels = list(map(int, ras))
+
+    ax.set_xticks(ra_tick_locs)
+    ax.set_xticklabels(ra_tick_labels)
+
+    ax.set_yticks(dec_tick_locs)
+    ax.set_yticklabels(dec_tick_labels)
+
+#     edge = 0.15
+
+    ax.set_xlim(-edge, edge)
+    ax.set_ylim(-edge, edge)
+
+    ax.set_xlabel('Right Ascension (degrees)')
+    ax.set_ylabel('Declination (degrees)')
+
+    ax.set_title(f'JD {int(times[0])}, Frequency ' + str(np.around(frequency_mhz, 2)) + ' MHz')
+
+    lst = np.around(12/np.pi * HSI.lsts[tidx], 2)
+    ax.text(0.05, 0.95, f'LST {lst} hr', fontsize=20, color='white', transform=ax.transAxes)
+
+    plt.show()
