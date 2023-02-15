@@ -12,6 +12,7 @@ from astropy import units
 from astropy.coordinates import SkyCoord, AltAz, EarthLocation
 from astropy.time import Time
 
+import matplotlib.pyplot as plt
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from matplotlib.transforms import Bbox
 
@@ -145,7 +146,7 @@ def get_taper(uv_grid, uv_vectors, taper_type='hann'):
 class HERASnapshotImager:
 
     def __init__(self, vis_data, b_vectors, freqs_hz, lsts, times,
-                 pad_factor=2.0, delta_uv=1.0):
+                 pad_factor=2.0, delta_uv=0.5):
 
         self.times = times
         self.lsts = lsts
@@ -191,7 +192,7 @@ class HERASnapshotImager:
         self.l_ax = l_ax
         self.m_ax = np.copy(l_ax)
 
-    def compute_gridded_mfs_images(self, taper_type='hann', gaussian_taper_tol=1e-8, kernel_size=0.5, weighted=True):
+    def compute_gridded_mfs_images(self, taper_type='hann', gaussian_taper_tol=1e-8, kernel_size=0.25, weighted=True):
 
         self.gaussian_taper_tol = gaussian_taper_tol
 
@@ -218,12 +219,12 @@ class HERASnapshotImager:
             unit_data = np.ones(uv_vectors.shape[0], dtype=complex)
 
             sampling = np.real(eval_uv_interp(self.uv_grid, uv_vectors, eps, unit_data))
-
-            self.weights = 1 / (1e-8 + sampling)
-            self.weights /= np.mean(weights)
+            r = 1e-2
+            self.weights = 1 / (r + sampling)
 
             uv_taper *= self.weights
 
+        self.uv_taper = uv_taper
         for i_t in range(self.Nt):
 
             uv_vals = np.concatenate([np.r_[self.vis_data[i_t, i_f], np.conj(self.vis_data[i_t, i_f])] for i_f in range(self.Nf)],axis=0)
@@ -234,14 +235,12 @@ class HERASnapshotImager:
 
             mfs_img = np.fft.fft2((np.fft.ifftshift(uv_interp, axes=(0,1))))
             mfs_img = np.fft.fftshift(mfs_img, axes=(0,1))
-            mfs_img = np.real(mfs_img) * (2*np.pi)**2 * self.delta_uv**2 / mfs_img.size
+            mfs_img = np.real(mfs_img) / ( 2*np.sum(uv_taper)*self.delta_uv**2. )
             mfs_img = np.fliplr(mfs_img)
 
             self.mfs_images[i_t] = mfs_img
 
     def compute_single_channel_spline_images(self, taper_type='hann'):
-
-        self.uv_taper_scale = uv_taper_scale
 
         self.img_ests = np.zeros((self.Nf, self.Nt, self.Np, self.Np))
 
@@ -408,7 +407,7 @@ def image_plot(HSI, tidx, fidx, vmin=None,vmax=None, mfs=False, edge=0.15):
         return ra_curves
 
     decs = np.linspace(-20,-40,5)
-    dec_curves = get_lines_of_constant_dec(decs, HSI.times[0], HSI.lsts[0], hera_location)
+    dec_curves = get_lines_of_constant_dec(decs, HSI.times[tidx], HSI.lsts[tidx], hera_location)
 
     all_ras = np.linspace(0, 360, 360//5 + 1)
     dec0 = HERA_LAT
@@ -494,7 +493,7 @@ def image_plot(HSI, tidx, fidx, vmin=None,vmax=None, mfs=False, edge=0.15):
     ax.set_xlabel('Right Ascension (degrees)')
     ax.set_ylabel('Declination (degrees)')
 
-    ax.set_title(f'JD {int(times[0])}, Frequency ' + str(np.around(frequency_mhz, 2)) + ' MHz')
+    ax.set_title(f'JD {int(HSI.times[tidx]) }, Frequency ' + str(np.around(frequency_mhz, 2)) + ' MHz')
 
     lst = np.around(12/np.pi * HSI.lsts[tidx], 2)
     ax.text(0.05, 0.95, f'LST {lst} hr', fontsize=20, color='white', transform=ax.transAxes)
