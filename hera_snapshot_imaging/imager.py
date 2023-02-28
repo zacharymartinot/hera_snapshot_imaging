@@ -116,7 +116,7 @@ def grid_boundary_angle(uv_grid, t0):
     uv_t[np.where(uv_t < t0)] += 2*np.pi
     return uv_t
 
-def get_taper(uv_grid, uv_vectors, taper_type='hann'):
+def get_taper(uv_grid, uv_vectors, taper_type='hann', gaussian_taper_tol=1e-8, edge_padding=1.0):
 
     bounding_curve, t0 = get_bounding_curve(uv_vectors)
 
@@ -124,7 +124,7 @@ def get_taper(uv_grid, uv_vectors, taper_type='hann'):
 
     uv_grid_boundary_points = bounding_curve(uv_grid_angles)
 
-    L_grid = np.sqrt(np.sum(np.square(uv_grid_boundary_points), axis=-1))
+    L_grid = edge_padding * np.sqrt(np.sum(np.square(uv_grid_boundary_points), axis=-1))
     uv_grid_length = np.sqrt(np.sum(np.square(uv_grid), axis=-1))
 
     interior_pts = np.asarray(uv_grid_length < L_grid)
@@ -134,14 +134,68 @@ def get_taper(uv_grid, uv_vectors, taper_type='hann'):
         L = L_grid[interior_pts]
         taper[interior_pts] = np.cos(0.5*np.pi * x / L)**2
     elif taper_type == 'gaussian':
-        r = uv_grid_length[interior_pts]
-        eps = np.max(L_grid)/np.sqrt(np.log(1e8))
-        taper[interior_pts] = np.exp(-(r/eps)**2)
+        r = uv_grid_length
+        eps = np.max(L_grid)/np.sqrt(np.log(1/gaussian_taper_tol))
+        taper = np.exp(-(r/eps)**2)
 
     else:
         taper[interior_pts] = 1.0
 
     return taper
+
+@nb.njit("c16[:,:](f8[:,:,:], f8[:,:], f8[:], c16[:])", fastmath=True, parallel=True, cache=True)
+def eval_uv_gridding(uv_grid, uv_nodes, eps_arr, coeffs):
+    tol = 1e-14
+
+    Nu, Nv = uv_grid.shape[0], uv_grid.shape[1]
+    Nn = uv_nodes.shape[0]
+
+    u_ax = uv_grid[0,:,0]
+    v_ax = uv_grid[:,0,1]
+
+    delta_uv = u_ax[1] - u_ax[0]
+
+    uv_interp = np.zeros((Nu, Nv), dtype=nb.complex128)
+    weights = np.zeros((Nu, Nv), dtype=nb.float64)
+
+    for nn in nb.prange(Nn):
+        eps_arr[nn] = eps_arr[nn]
+        uv_n = uv_nodes[nn]
+        c_n = coeffs[nn]
+
+        # half size of the bounding square
+        kernel_size = eps_arr[nn] * np.sqrt(np.log(1/tol))
+
+        # half the number of grid points on a side
+        Nk = int(np.ceil(kernel_size / delta_uv))
+
+        # indices of nearest grid point to the node
+        ic_un = np.argmin(np.abs(uv_n[0] - u_ax))
+        ic_vn = np.argmin(np.abs(uv_n[1] - v_ax))
+
+        # indices of the bounding square on the grid
+        i0_u = ic_un - Nk
+        i1_u = ic_un + Nk + 1
+
+        i0_v = ic_vn - Nk
+        i1_v = ic_vn + Nk + 1
+
+        for ii in range(i0_v, i1_v):
+            for jj in range(i0_u, i1_u):
+
+                r_eval = np.sqrt(np.sum(np.square(uv_grid[ii,jj,:] - uv_nodes[nn,:])))
+
+                if r_eval < kernel_size:
+                    g = gaussian(r_eval, eps_arr[nn])
+                    uv_interp[ii,jj] += g * coeffs[nn]
+                    weights[ii,jj] += gaussian(r_eval, 1.1*eps_arr[nn])
+
+    for ii in range(Nu):
+        for jj in range(Nv):
+            if weights[ii, jj] != 0.0:
+                uv_interp[ii,jj] /= weights[ii,jj]
+
+    return uv_interp
 
 class HERASnapshotImager:
 
@@ -192,34 +246,35 @@ class HERASnapshotImager:
         self.l_ax = l_ax
         self.m_ax = np.copy(l_ax)
 
-    def compute_gridded_mfs_images(self, taper_type='hann', gaussian_taper_tol=1e-8, kernel_size=0.25, weighted=True):
+    def compute_gridded_mfs_images(self, taper_type='hann', gaussian_taper_tol=1e-8, kernel_size=1.0, weighted=False, r=0.5, edge_padding=1.1):
 
         self.gaussian_taper_tol = gaussian_taper_tol
 
         self.mfs_images = np.zeros((self.Nt, self.Np, self.Np))
+        self.uv_interp = np.zeros((self.Nt, self.Np, self.Np), dtype=complex)
 
         inv_lambda = self.nu_hz / c_mps
         uv_vectors = np.concatenate([nc * self.b_vectors for nc in inv_lambda], axis=0)
+        self.uv_vectors = uv_vectors
 
-        if taper_type == 'gaussian':
-
-            uv_taper_scale = np.sqrt(np.log(1/gaussian_taper_tol)) * (np.max(self.nu_hz)/ c_mps) * max(self.max_be, self.max_bn)
-
-            uv_taper = np.exp(-(self.uv_grid[...,0]**2. + self.uv_grid[...,1]**2.)/uv_taper_scale**2.)
+        if taper_type == 'none':
+            uv_taper = np.ones_like(self.uv_grid[:,:,0])
 
         else:
             # hann or top-hat over convex hull of uv samples
-            uv_taper = get_taper(self.uv_grid[...,:2], uv_vectors[:,:2], taper_type=taper_type)
+            uv_taper = get_taper(self.uv_grid[...,:2], uv_vectors[:,:2], taper_type=taper_type, gaussian_taper_tol=gaussian_taper_tol, edge_padding=edge_padding)
 
-        eps = kernel_size*(np.mean(self.nu_hz) / c_mps) * np.min(self.b_min_dist)
+        # eps = kernel_size*(np.mean(self.nu_hz) / c_mps) * np.min(self.b_min_dist)
+        eps = np.pi * self.delta_uv
         eps = eps * np.ones(uv_vectors.shape[0])
+
+        unit_data = np.ones(uv_vectors.shape[0], dtype=complex)
+
+        sampling = np.real(eval_uv_gridding(self.uv_grid, uv_vectors, eps, unit_data))
+        self.sampling = sampling
 
         if weighted:
 
-            unit_data = np.ones(uv_vectors.shape[0], dtype=complex)
-
-            sampling = np.real(eval_uv_interp(self.uv_grid, uv_vectors, eps, unit_data))
-            r = 1e-2
             self.weights = 1 / (r + sampling)
 
             uv_taper *= self.weights
@@ -229,9 +284,11 @@ class HERASnapshotImager:
 
             uv_vals = np.concatenate([np.r_[self.vis_data[i_t, i_f], np.conj(self.vis_data[i_t, i_f])] for i_f in range(self.Nf)],axis=0)
 
-            uv_interp = eval_uv_interp(self.uv_grid, uv_vectors, eps, uv_vals)
+            uv_interp = eval_uv_gridding(self.uv_grid, uv_vectors, eps, uv_vals)
 
             uv_interp *= uv_taper
+
+            self.uv_interp[i_t] = uv_interp
 
             mfs_img = np.fft.fft2((np.fft.ifftshift(uv_interp, axes=(0,1))))
             mfs_img = np.fft.fftshift(mfs_img, axes=(0,1))
