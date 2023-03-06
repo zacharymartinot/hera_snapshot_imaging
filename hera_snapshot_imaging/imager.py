@@ -143,8 +143,8 @@ def get_taper(uv_grid, uv_vectors, taper_type='hann', gaussian_taper_tol=1e-8, e
 
     return taper
 
-@nb.njit("c16[:,:](f8[:,:,:], f8[:,:], f8[:], c16[:])", fastmath=True, parallel=True, cache=True)
-def eval_uv_gridding(uv_grid, uv_nodes, eps_arr, coeffs):
+@nb.njit("c16[:,:](f8[:,:,:], f8[:,:], f8[:], c16[:], f8)", fastmath=True, parallel=True, cache=True)
+def eval_uv_gridding(uv_grid, uv_nodes, eps_arr, coeffs, mollification_factor):
     tol = 1e-14
 
     Nu, Nv = uv_grid.shape[0], uv_grid.shape[1]
@@ -188,7 +188,11 @@ def eval_uv_gridding(uv_grid, uv_nodes, eps_arr, coeffs):
                 if r_eval < kernel_size:
                     g = gaussian(r_eval, eps_arr[nn])
                     uv_interp[ii,jj] += g * coeffs[nn]
-                    weights[ii,jj] += gaussian(r_eval, 1.1*eps_arr[nn])
+
+                    if mollification_factor == 0.0:
+                        weights[ii,jj] = 1.0
+                    else:
+                        weights[ii,jj] += gaussian(r_eval, mollification_factor*eps_arr[nn])
 
     for ii in range(Nu):
         for jj in range(Nv):
@@ -246,7 +250,7 @@ class HERASnapshotImager:
         self.l_ax = l_ax
         self.m_ax = np.copy(l_ax)
 
-    def compute_gridded_mfs_images(self, taper_type='hann', gaussian_taper_tol=1e-8, kernel_size=1.0, weighted=False, r=0.5, edge_padding=1.1):
+    def compute_gridded_mfs_images(self, taper_type='hann', gaussian_taper_tol=1e-8, kernel_size=1.0, weighted=False, r=0.5, edge_padding=1.1, mollification_factor=1.1):
 
         self.gaussian_taper_tol = gaussian_taper_tol
 
@@ -265,16 +269,14 @@ class HERASnapshotImager:
             uv_taper = get_taper(self.uv_grid[...,:2], uv_vectors[:,:2], taper_type=taper_type, gaussian_taper_tol=gaussian_taper_tol, edge_padding=edge_padding)
 
         # eps = kernel_size*(np.mean(self.nu_hz) / c_mps) * np.min(self.b_min_dist)
-        eps = np.pi * self.delta_uv
+        eps = kernel_size * np.pi * self.delta_uv
         eps = eps * np.ones(uv_vectors.shape[0])
 
-        unit_data = np.ones(uv_vectors.shape[0], dtype=complex)
-
-        sampling = np.real(eval_uv_gridding(self.uv_grid, uv_vectors, eps, unit_data))
-        self.sampling = sampling
-
         if weighted:
+            unit_data = np.ones(uv_vectors.shape[0], dtype=complex)
 
+            sampling = np.real(eval_uv_gridding(self.uv_grid, uv_vectors, eps, unit_data, mollification_factor))
+            self.sampling = sampling
             self.weights = 1 / (r + sampling)
 
             uv_taper *= self.weights
@@ -284,7 +286,7 @@ class HERASnapshotImager:
 
             uv_vals = np.concatenate([np.r_[self.vis_data[i_t, i_f], np.conj(self.vis_data[i_t, i_f])] for i_f in range(self.Nf)],axis=0)
 
-            uv_interp = eval_uv_gridding(self.uv_grid, uv_vectors, eps, uv_vals)
+            uv_interp = eval_uv_gridding(self.uv_grid, uv_vectors, eps, uv_vals, mollification_factor)
 
             uv_interp *= uv_taper
 
@@ -392,7 +394,7 @@ def ra_distance_degrees(ra1, ra2):
     abs_diff = np.abs(ra1 - ra2)
     return min(abs_diff, abs(abs_diff - 360.))
 
-def image_plot(HSI, tidx, fidx, vmin=None,vmax=None, mfs=False, edge=0.15):
+def image_plot(HSI, tidx, fidx, vmin=None,vmax=None, mfs=False, edge=0.15, show_radec=True):
 
     l_ax = HSI.l_ax
     m_ax = HSI.m_ax
@@ -509,46 +511,52 @@ def image_plot(HSI, tidx, fidx, vmin=None,vmax=None, mfs=False, edge=0.15):
     cax = divider.append_axes("right", size="5%", pad=0.01)
     cbar = fig.colorbar(img, cax=cax)
 
-    dec_tick_locs = []
-    for dec in dec_curves:
-        dec_curve = dec_curves[dec]
+    if show_radec:
+        dec_tick_locs = []
+        for dec in dec_curves:
+            dec_curve = dec_curves[dec]
 
-        ax.plot(l_ax, dec_curve(l_ax), '--w', linewidth=1)
-        dec_tick_locs.append(dec_curve(-0.2))
+            ax.plot(l_ax, dec_curve(l_ax), '--w', linewidth=1)
+            dec_tick_locs.append(dec_curve(-0.2))
 
-    dec_tick_labels = list(map(int,decs))
+        dec_tick_labels = list(map(int,decs))
 
-    ra_tick_locs = []
-    for ra in ra_curves:
-        ra_curve = ra_curves[ra]
-        try:
-            m_vals = ra_curve(-l_ax)
-            l_idx = np.nanargmin(abs(-0.2 - m_vals))
+        ra_tick_locs = []
+        for ra in ra_curves:
+            ra_curve = ra_curves[ra]
+            try:
+                m_vals = ra_curve(-l_ax)
+                l_idx = np.nanargmin(abs(-0.2 - m_vals))
 
-            ax.plot(l_ax, m_vals, '--w', linewidth=1)
+                ax.plot(l_ax, m_vals, '--w', linewidth=1)
 
-            ra_tick_locs.append(l_ax[l_idx])
-        except ValueError:
-            print(ra, ra0)
-            ax.plot([0., 0.], [-1,1], '--w', linewidth=1)
+                ra_tick_locs.append(l_ax[l_idx])
+            except ValueError:
+                print(ra, ra0)
+                ax.plot([0., 0.], [-1,1], '--w', linewidth=1)
 
-            ra_tick_locs.append(0.0)
+                ra_tick_locs.append(0.0)
 
-    ra_tick_labels = list(map(int, ras))
+        ra_tick_labels = list(map(int, ras))
 
-    ax.set_xticks(ra_tick_locs)
-    ax.set_xticklabels(ra_tick_labels)
+        ax.set_xticks(ra_tick_locs)
+        ax.set_xticklabels(ra_tick_labels)
 
-    ax.set_yticks(dec_tick_locs)
-    ax.set_yticklabels(dec_tick_labels)
+        ax.set_yticks(dec_tick_locs)
+        ax.set_yticklabels(dec_tick_labels)
+        ax.set_xlabel('Right Ascension (degrees)')
+        ax.set_ylabel('Declination (degrees)')
 
-#     edge = 0.15
+    else:
+        ax.set_xlabel('l')
+        ax.set_ylabel('m')
 
     ax.set_xlim(-edge, edge)
     ax.set_ylim(-edge, edge)
 
-    ax.set_xlabel('Right Ascension (degrees)')
-    ax.set_ylabel('Declination (degrees)')
+    if edge > 1/np.sqrt(2.):
+        horizon = plt.Circle((0,0), 1.0, color='black', fill=False, clip_on=True)
+        ax.add_patch(horizon)
 
     ax.set_title(f'JD {int(HSI.times[tidx]) }, Frequency ' + str(np.around(frequency_mhz, 2)) + ' MHz')
 
