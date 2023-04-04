@@ -52,11 +52,11 @@ def eval_uv_interp(uv_grid, uv_nodes, eps_arr, coeffs):
         ic_vn = np.argmin(np.abs(uv_n[1] - v_ax))
 
         # indices of the bounding square on the grid
-        i0_u = ic_un - Nk
-        i1_u = ic_un + Nk + 1
+        i0_u = max(ic_un - Nk, 0)
+        i1_u = min(ic_un + Nk + 1, Nu)
 
-        i0_v = ic_vn - Nk
-        i1_v = ic_vn + Nk + 1
+        i0_v = max(ic_vn - Nk, 0)
+        i1_v = min(ic_vn + Nk + 1, Nv)
 
         for ii in range(i0_v, i1_v):
             for jj in range(i0_u, i1_u):
@@ -174,11 +174,11 @@ def eval_uv_gridding(uv_grid, uv_nodes, eps_arr, coeffs, mollification_factor):
         ic_vn = np.argmin(np.abs(uv_n[1] - v_ax))
 
         # indices of the bounding square on the grid
-        i0_u = ic_un - Nk
-        i1_u = ic_un + Nk + 1
+        i0_u = max(ic_un - Nk, 0)
+        i1_u = min(ic_un + Nk + 1, Nu)
 
-        i0_v = ic_vn - Nk
-        i1_v = ic_vn + Nk + 1
+        i0_v = max(ic_vn - Nk, 0)
+        i1_v = min(ic_vn + Nk + 1, Nv)
 
         for ii in range(i0_v, i1_v):
             for jj in range(i0_u, i1_u):
@@ -190,7 +190,7 @@ def eval_uv_gridding(uv_grid, uv_nodes, eps_arr, coeffs, mollification_factor):
                     uv_interp[ii,jj] += g * coeffs[nn]
 
                     if mollification_factor == 0.0:
-                        weights[ii,jj] = 1.0
+                        weights[ii,jj] += 1.0
                     else:
                         weights[ii,jj] += gaussian(r_eval, mollification_factor*eps_arr[nn])
 
